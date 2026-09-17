@@ -1,0 +1,6 @@
+old/
+runs/
+cache/
+data/
+.vscode/
+*.out
