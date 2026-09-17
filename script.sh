@@ -2,11 +2,16 @@
 # Prepare and run distributed retriever training on a rented NVIDIA GPU server.
 #
 # Put this file, train_retriever_st51.py, and
-# requirements-retriever-st51.txt in the same directory on the server.
+# requirements.txt in the same directory on the server.
 #
 # Required environment variables:
 #   DATASET_REPO=owner/dataset-repo
 #   MODEL_REPO=owner/output-model-repo     # required only for train mode
+#
+# Dataset layout defaults to two Hugging Face dataset configurations:
+#   load_dataset(DATASET_REPO, "corpus", split="train")
+#   load_dataset(DATASET_REPO, "train", split="train")
+# Set DATASET_LAYOUT=files for repositories containing literal JSONL files.
 #
 # Authentication:
 #   Run `hf auth login` once, or export HF_TOKEN from your provider's secret
@@ -40,8 +45,16 @@ START_DIR="$(pwd -P)"
 DATASET_REPO="${DATASET_REPO:-}"
 MODEL_REPO="${MODEL_REPO:-}"
 DATASET_REVISION="${DATASET_REVISION:-main}"
+# configs: load named dataset configurations and materialize them locally.
+# files: download literal JSONL paths from the dataset repository.
+DATASET_LAYOUT="${DATASET_LAYOUT:-configs}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-train}"
+CORPUS_CONFIG="${CORPUS_CONFIG:-corpus}"
+TRAIN_SPLIT="${TRAIN_SPLIT:-train}"
+CORPUS_SPLIT="${CORPUS_SPLIT:-train}"
 TRAIN_FILE="${TRAIN_FILE:-train.jsonl}"
 CORPUS_FILE="${CORPUS_FILE:-corpus.jsonl}"
+FORCE_DATA_EXPORT="${FORCE_DATA_EXPORT:-0}"
 
 WORK_ROOT="${WORK_ROOT:-${START_DIR}/retriever-work}"
 DATA_DIR="${DATA_DIR:-${WORK_ROOT}/data}"
@@ -51,8 +64,8 @@ HF_CACHE_DIR="${HF_CACHE_DIR:-${WORK_ROOT}/hf-cache}"
 VENV_DIR="${VENV_DIR:-${WORK_ROOT}/venv}"
 LOG_DIR="${LOG_DIR:-${WORK_ROOT}/logs}"
 
-TRAINER_SCRIPT="${TRAINER_SCRIPT:-${SCRIPT_DIR}/train_retriever_st51.py}"
-REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-${SCRIPT_DIR}/requirements-retriever-st51.txt}"
+TRAINER_SCRIPT="${TRAINER_SCRIPT:-${SCRIPT_DIR}/train.py}"
+REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-${SCRIPT_DIR}/requirements.txt}"
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 TORCH_CUDA_INDEX="${TORCH_CUDA_INDEX:-cu124}" # also supported: cu118, cu126
 SKIP_INSTALL="${SKIP_INSTALL:-0}"
@@ -61,7 +74,7 @@ NUM_GPUS="${NUM_GPUS:-2}"
 BASE_MODEL="${BASE_MODEL:-intfloat/multilingual-e5-base}"
 EPOCHS="${EPOCHS:-2}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
-MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-16}"
+MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
 NEGATIVES="${NEGATIVES:-8}"
 MAX_LENGTH="${MAX_LENGTH:-512}"
 LEARNING_RATE="${LEARNING_RATE:-2e-5}"
@@ -111,6 +124,13 @@ case "${TORCH_CUDA_INDEX}" in
     exit 2
     ;;
 esac
+case "${DATASET_LAYOUT}" in
+  configs|files) ;;
+  *)
+    echo "DATASET_LAYOUT must be configs or files" >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "${WORK_ROOT}" "${DATA_DIR}" "${CACHE_DIR}" "${OUTPUT_DIR}" \
   "${HF_CACHE_DIR}" "${LOG_DIR}"
@@ -125,8 +145,14 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 echo "Mode:              ${MODE}"
 echo "Dataset:           ${DATASET_REPO}@${DATASET_REVISION}"
-echo "Training file:     ${TRAIN_FILE}"
-echo "Corpus file:       ${CORPUS_FILE}"
+echo "Dataset layout:    ${DATASET_LAYOUT}"
+if [[ "${DATASET_LAYOUT}" == "configs" ]]; then
+  echo "Training source:   ${TRAIN_CONFIG}/${TRAIN_SPLIT}"
+  echo "Corpus source:     ${CORPUS_CONFIG}/${CORPUS_SPLIT}"
+else
+  echo "Training file:     ${TRAIN_FILE}"
+  echo "Corpus file:       ${CORPUS_FILE}"
+fi
 echo "Work directory:    ${WORK_ROOT}"
 echo "CUDA wheel index:  ${TORCH_CUDA_INDEX}"
 echo "Requested GPUs:    ${NUM_GPUS}"
@@ -227,16 +253,107 @@ fi
 echo "Hugging Face authentication: OK"
 
 # ---------------------------------------------------------------------------
-# Download only the two required data files and validate their schemas.
+# Materialize the two configurations (or download two literal files), then
+# validate the local JSONL schemas used by the trainer.
 # ---------------------------------------------------------------------------
-
-hf download "${DATASET_REPO}" "${TRAIN_FILE}" "${CORPUS_FILE}" \
-  --repo-type dataset \
-  --revision "${DATASET_REVISION}" \
-  --local-dir "${DATA_DIR}"
 
 TRAIN_PATH="${DATA_DIR}/${TRAIN_FILE}"
 CORPUS_PATH="${DATA_DIR}/${CORPUS_FILE}"
+
+if [[ "${DATASET_LAYOUT}" == "configs" ]]; then
+  DATASET_REPO="${DATASET_REPO}" \
+  DATASET_REVISION="${DATASET_REVISION}" \
+  TRAIN_CONFIG="${TRAIN_CONFIG}" \
+  CORPUS_CONFIG="${CORPUS_CONFIG}" \
+  TRAIN_SPLIT="${TRAIN_SPLIT}" \
+  CORPUS_SPLIT="${CORPUS_SPLIT}" \
+  TRAIN_PATH="${TRAIN_PATH}" \
+  CORPUS_PATH="${CORPUS_PATH}" \
+  FORCE_DATA_EXPORT="${FORCE_DATA_EXPORT}" \
+  python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+from datasets import load_dataset
+
+
+repository = os.environ["DATASET_REPO"]
+revision = os.environ["DATASET_REVISION"]
+force = os.environ["FORCE_DATA_EXPORT"] == "1"
+
+
+def materialize(config: str, split: str, destination: Path) -> None:
+    specification = {
+        "repository": repository,
+        "revision": revision,
+        "config": config,
+        "split": split,
+    }
+    manifest = destination.with_suffix(destination.suffix + ".source.json")
+
+    if not force and destination.is_file() and destination.stat().st_size > 0 and manifest.is_file():
+        try:
+            if json.loads(manifest.read_text(encoding="utf-8")) == specification:
+                print(f"Reusing materialized dataset: {destination}")
+                return
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary_manifest = manifest.with_suffix(manifest.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+    temporary_manifest.unlink(missing_ok=True)
+
+    print(
+        f"Loading {repository!r}, config={config!r}, split={split!r}, "
+        f"revision={revision!r}"
+    )
+    dataset = load_dataset(
+        repository,
+        config,
+        split=split,
+        revision=revision,
+        keep_in_memory=False,
+    )
+    print(f"Materializing {len(dataset):,} rows to {destination}")
+    dataset.to_json(
+        temporary,
+        orient="records",
+        lines=True,
+        force_ascii=False,
+        batch_size=1_000,
+        num_proc=1,
+    )
+    if not temporary.is_file() or temporary.stat().st_size == 0:
+        raise RuntimeError(f"dataset export produced an empty file: {temporary}")
+
+    temporary_manifest.write_text(
+        json.dumps(specification, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, destination)
+    os.replace(temporary_manifest, manifest)
+
+
+materialize(
+    os.environ["CORPUS_CONFIG"],
+    os.environ["CORPUS_SPLIT"],
+    Path(os.environ["CORPUS_PATH"]),
+)
+materialize(
+    os.environ["TRAIN_CONFIG"],
+    os.environ["TRAIN_SPLIT"],
+    Path(os.environ["TRAIN_PATH"]),
+)
+PY
+else
+  hf download "${DATASET_REPO}" "${TRAIN_FILE}" "${CORPUS_FILE}" \
+    --repo-type dataset \
+    --revision "${DATASET_REVISION}" \
+    --local-dir "${DATA_DIR}"
+fi
 
 for required_file in "${TRAIN_PATH}" "${CORPUS_PATH}"; do
   if [[ ! -s "${required_file}" ]]; then
