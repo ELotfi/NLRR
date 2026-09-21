@@ -4,3 +4,4 @@ cache/
 data/
 .vscode/
 *.out
+*.ipynb
