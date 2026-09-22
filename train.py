@@ -368,6 +368,7 @@ def main():
 					help="for CachedMultipleNegativesRankingLoss")
 	ap.add_argument("--negatives", type=int, default=8)
 	ap.add_argument("--lr", type=float, default=1.5e-5)
+	ap.add_argument("--scale", type=float, default=50.0)
 	ap.add_argument("--max-len", type=int, default=512)
 	ap.add_argument("--val-frac", type=float, default=0.03)
 	ap.add_argument("--eval-queries", type=int, default=500)
@@ -426,7 +427,7 @@ def main():
 	model.prompts = {"query": f"Instruct: {TASK_DESCRIPTION}\nQuery: ", "document": ""}
 
 	loss = CachedMultipleNegativesRankingLoss(
-		model, mini_batch_size=args.mini_batch, gather_across_devices=args.gather_across_devices, scale=20.0)
+		model, mini_batch_size=args.mini_batch, gather_across_devices=args.gather_across_devices, scale=args.scale)
 
 	push = bool(args.hub_model_id)
 
