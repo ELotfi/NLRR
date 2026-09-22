@@ -1,692 +1,525 @@
-"""Distributed retriever training for a pinned, non-legacy stack.
+"""
+train_retriever_e5.py
+---------------------------------------------------------------------------
+Fine-tune intfloat/multilingual-e5-* on the legal retrieval dataset from the
+Hugging Face Hub, multi-GPU, pushing checkpoints to the Hub and logging to
+TensorBoard.
 
-Target versions:
-    sentence-transformers 5.1.x
-    transformers          4.52.x
-    torch                 2.6.x
+	source env.sh
+	accelerate launch train_retriever_e5.py \
+		--dataset $HF_DATASET --hub-model-id $HF_MODEL_REPO
 
-Launch with torchrun so a saved Accelerate profile cannot silently enable
-FSDP or DeepSpeed:
+DATA (one Hub repo, two configs)
+	corpus : {"id", "text"}
+	train  : {"query", "positives", "negatives", "cluster", "weight", ...}
 
-    torchrun --standalone --nproc_per_node=2 train_retriever_st51.py \
-        --data data/train.jsonl \
-        --corpus data/corpus.jsonl \
-        --model intfloat/multilingual-e5-base \
-        --output runs/me5-base \
-        --cache-dir retriever-cache \
-        --negatives 8 \
-        --batch-size 256 \
-        --mini-batch-size 32 \
-        --push-to-hub \
-        --hub-model-id your-name/me5-base-retriever
+MULTI-GPU
+`accelerate launch` runs this whole script once PER GPU. Preparation therefore
+happens on rank 0 only, the others wait at a barrier, and everyone then reads
+the same memory-mapped files. Without that guard, N processes each built the
+corpus dict (N x RAM) and wrote the same files concurrently.
 
-With --push-to-hub, the latest resumable checkpoint is uploaded to the
-repository's last-checkpoint directory at every local checkpoint save. Set
-HF_TOKEN in the environment or authenticate once with `hf auth login`; never
-put a token directly in this command. TensorBoard logs are written to
-OUTPUT/tensorboard by default.
+MEMORY
+  * the corpus dict exists on rank 0 only, and only during preparation
+  * examples are streamed to JSONL and reloaded as memory-mapped Arrow
+  * the in-training evaluator uses a capped corpus slice written to disk
 
-Input files:
-    corpus.jsonl: {"id": "doc-id", "text": "..."}
-    train.jsonl:  {
-        "query": "...",
-        "positives": ["doc-id", ...],
-        "negatives": ["doc-id" | {"id": "doc-id", ...}, ...],
-        "cluster": "group-id"  # optional; source_case/query are fallbacks
-    }
+E5 CONVENTIONS
+  * "query: " on queries, "passage: " on documents -- also stored in the saved
+	model as prompts, so whoever loads it from the Hub gets them by default
+  * mean pooling, RIGHT padding, max_seq_length 512
 
-The training dataset stores queries and document IDs only. Corpus text lives in
-a memory-mapped Arrow dataset and is fetched for the current batch. This avoids
-expanding millions of samples into tens of gigabytes of duplicate Python text.
+CHECKPOINTS -> HUB
+hub_strategy="checkpoint" pushes each save AND a resumable `last-checkpoint`
+folder. If the rented box dies, resume on a new one with --resume.
+---------------------------------------------------------------------------
 """
 
 from __future__ import annotations
 
 import argparse
-import gc
 import hashlib
+import inspect
 import json
 import logging
+import math
 import os
 import random
-import shutil
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Iterator
-
-# This script deliberately supports plain DDP only. These assignments happen
-# before importing Transformers/Accelerate so external profiles cannot opt in to
-# a different distributed backend.
-os.environ["ACCELERATE_USE_FSDP"] = "false"
-os.environ["ACCELERATE_USE_DEEPSPEED"] = "false"
-os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "false"
 
 import torch
-from datasets import Dataset, DatasetDict, Features, Value, load_dataset, load_from_disk
-from filelock import FileLock
-from sentence_transformers import (
-    SentenceTransformer,
-    SentenceTransformerTrainer,
-    SentenceTransformerTrainingArguments,
-)
+from accelerate import PartialState
+from datasets import load_dataset
+from sentence_transformers import (SentenceTransformer,
+								   SentenceTransformerTrainer,
+								   SentenceTransformerTrainingArguments)
+from sentence_transformers.evaluation import InformationRetrievalEvaluator
 from sentence_transformers.losses import CachedMultipleNegativesRankingLoss
 from sentence_transformers.training_args import BatchSamplers
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [rank=%(rank)s] %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger(__name__)
+
+# QUERY_PREFIX = "query: "
+# DOC_PREFIX = "passage: "
+QUERY_PREFIX = "Query: "
+DOC_PREFIX = ""
+TASK_DESCRIPTION = "Given a Dutch legal query, retrieve relevant articles that help answer the query."
+
+# ------------------------- PREPARATION (rank 0 only) -----------------------
+
+def cluster_bucket(cluster: str, buckets: int = 100) -> int:
+	"""Deterministic split by cluster: no set of clusters or list of rows is
+	held, and a dispute pattern never straddles train/val."""
+	h = hashlib.blake2b(str(cluster).encode("utf-8"), digest_size=8).digest()
+	return int.from_bytes(h, "big") % buckets
 
 
-class RankFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.rank = int(os.environ.get("RANK", "0"))
-        return True
+def load_corpus(dataset: str, config: str) -> dict[str, str]:
+	ds = load_dataset(dataset, config, split="train")
+	corpus = {}
+	for rec in ds:                     # Arrow-backed; rows paged in on demand
+		t = (rec.get("text") or "").strip()
+		if t:
+			corpus[rec["id"]] = t
+	return corpus
 
 
-for handler in logging.getLogger().handlers:
-    handler.addFilter(RankFilter())
-log = logging.getLogger("retriever-training")
-
-CACHE_VERSION = 1
-
-
-# ---------------------------------------------------------------------------
-# Version and argument validation
-# ---------------------------------------------------------------------------
-
-def require_minor(package: str, expected_major: int, expected_minor: int) -> None:
-    try:
-        installed = version(package)
-    except PackageNotFoundError as error:
-        raise RuntimeError(f"required package is not installed: {package}") from error
-
-    numeric = installed.split("+", 1)[0].split(".")
-    actual = tuple(int(part) for part in numeric[:2])
-    expected = (expected_major, expected_minor)
-    if actual != expected:
-        raise RuntimeError(
-            f"{package} {installed} is installed; this script requires "
-            f"{expected_major}.{expected_minor}.x"
-        )
+def _neg_ids(negs) -> list[str]:
+	"""Negatives may arrive as [{"id","tier"}] or as bare ids, depending on how
+	the Hub dataset was serialised."""
+	out = []
+	for n in negs or []:
+		if isinstance(n, dict):
+			if n.get("id"):
+				out.append(n["id"])
+		elif n:
+			out.append(str(n))
+	return out
 
 
-def validate_versions() -> None:
-    require_minor("sentence-transformers", 5, 1)
-    require_minor("transformers", 4, 52)
-    require_minor("torch", 2, 6)
+
+def prep_query(query: str) -> str:
+	out = f'Instruct: {TASK_DESCRIPTION}\n' if TASK_DESCRIPTION else ''
+	return f'{out}{QUERY_PREFIX}{query}'
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True)
-    parser.add_argument("--corpus", required=True)
-    parser.add_argument("--model", default="intfloat/multilingual-e5-base")
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--cache-dir", required=True)
 
-    parser.add_argument("--epochs", type=float, default=2.0)
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=-1,
-        help="Override epochs; useful for a short smoke test",
-    )
-    parser.add_argument("--batch-size", type=int, default=128, help="Per GPU")
-    parser.add_argument("--mini-batch-size", type=int, default=16)
-    parser.add_argument("--negatives", type=int, default=8)
-    parser.add_argument("--max-length", type=int, default=512)
-    parser.add_argument("--learning-rate", type=float, default=2e-5)
-    parser.add_argument("--warmup-ratio", type=float, default=0.05)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-
-    parser.add_argument("--validation-fraction", type=float, default=0.01)
-    parser.add_argument("--max-eval-samples", type=int, default=2_000)
-    parser.add_argument("--eval-steps", type=int, default=1_000)
-    parser.add_argument("--save-steps", type=int, default=1_000)
-    parser.add_argument("--logging-steps", type=int, default=25)
-    parser.add_argument("--save-total-limit", type=int, default=2)
-
-    parser.add_argument(
-        "--report-to",
-        choices=("tensorboard", "none"),
-        default="tensorboard",
-        help="Metrics backend; TensorBoard is enabled by default",
-    )
-    parser.add_argument(
-        "--logging-dir",
-        default=None,
-        help="TensorBoard directory (default: OUTPUT/tensorboard)",
-    )
-    parser.add_argument(
-        "--run-name",
-        default=None,
-        help="Run label shown in logging integrations",
-    )
-
-    parser.add_argument(
-        "--push-to-hub",
-        action="store_true",
-        help="Upload models and checkpoints to the Hugging Face Hub",
-    )
-    parser.add_argument(
-        "--hub-model-id",
-        default=None,
-        help="Destination repository, e.g. username/model-name",
-    )
-    parser.add_argument(
-        "--hub-private",
-        action="store_true",
-        help="Create the Hub repository as private (ignored if it already exists)",
-    )
-    parser.add_argument(
-        "--hub-strategy",
-        choices=("end", "every_save", "checkpoint", "all_checkpoints"),
-        default="checkpoint",
-        help=(
-            "checkpoint uploads the latest resumable checkpoint as "
-            "last-checkpoint; all_checkpoints retains every remote checkpoint"
-        ),
-    )
-    parser.add_argument(
-        "--hub-always-push",
-        action="store_true",
-        help="Queue a new upload even if the previous asynchronous upload is unfinished",
-    )
-
-    parser.add_argument("--query-prefix", default="query: ")
-    parser.add_argument("--document-prefix", default="passage: ")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dataloader-workers", type=int, default=0)
-    parser.add_argument("--pin-memory", action="store_true")
-    parser.add_argument("--gather-across-devices", action="store_true")
-    parser.add_argument("--prepare-data-only", action="store_true")
-    parser.add_argument("--resume-from-checkpoint", default=None)
-
-    parser.add_argument(
-        "--lora",
-        action="store_true",
-        help="Train LoRA adapters instead of full fine-tuning",
-    )
-    parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
-    args = parser.parse_args()
-
-    if args.negatives < 0:
-        parser.error("--negatives must be non-negative")
-    if args.batch_size < 1 or args.mini_batch_size < 1:
-        parser.error("batch sizes must be positive")
-    if args.mini_batch_size > args.batch_size:
-        parser.error("--mini-batch-size cannot exceed --batch-size")
-    if not 0.0 < args.validation_fraction < 1.0:
-        parser.error("--validation-fraction must be between 0 and 1")
-    if args.save_steps % args.eval_steps != 0:
-        parser.error("--save-steps must be a multiple of --eval-steps")
-    if args.push_to_hub and not args.hub_model_id:
-        parser.error("--hub-model-id is required with --push-to-hub")
-    if not args.push_to_hub and args.hub_model_id:
-        parser.error("--hub-model-id requires --push-to-hub")
-    return args
+def prep_doc(doc: str) -> str:
+	return f'{DOC_PREFIX}{doc}'
 
 
-def validate_hub_authentication(args: argparse.Namespace) -> None:
-    """Fail before costly data/model setup when Hub credentials are absent."""
-    if not args.push_to_hub:
-        return
-    from huggingface_hub import get_token
 
-    if get_token() is None:
-        raise RuntimeError(
-            "--push-to-hub requires authentication. Set HF_TOKEN to a write "
-            "token or run `hf auth login` before launching torchrun."
-        )
+def write_examples(train_rows, corpus: dict[str, str], n_neg: int,
+				   train_out: Path, val_out: Path, val_frac: float,
+				   rng: random.Random, use_weights: bool = True) -> dict:
+	"""
+	Stream rows to two JSONL files; nothing accumulates in RAM.
 
+	Sample WEIGHTS are applied by importance sampling: a row with weight w is
+	kept with probability w. CachedMNRL has no per-example weight hook, and in
+	expectation this is equivalent to scaling that row's gradient.
+	"""
+	stats = {"train": 0, "val": 0, "skipped": 0, "downweighted": 0}
+	val_buckets = max(1, int(100 * val_frac))
 
-# ---------------------------------------------------------------------------
-# Compact disk-backed dataset construction
-# ---------------------------------------------------------------------------
+	with train_out.open("w", encoding="utf-8") as ftr, \
+			val_out.open("w", encoding="utf-8") as fva:
+		for r in train_rows:
+			q = (r.get("query") or "").strip()
+			pos = [p for p in (r.get("positives") or []) if p in corpus]
+			if not q or not pos:
+				stats["skipped"] += 1
+				continue
+			negs = [n for n in _neg_ids(r.get("negatives"))
+					if n in corpus and n not in set(pos)]
+			if len(negs) < n_neg:
+				stats["skipped"] += 1
+				continue
 
-def file_identity(path: Path) -> dict[str, int | str]:
-    stat = path.stat()
-    return {
-        "path": str(path.resolve()),
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-    }
+			w = float(r.get("weight") or 1.0)
+			if use_weights and w < 1.0 and rng.random() >= w:
+				stats["downweighted"] += 1
+				continue
 
+			p = rng.choice(pos)       # one positive per row, see module doc
+			row = {"anchor": prep_query(q), "positive": prep_doc(corpus[p])}
+			for i, nid in enumerate(rng.sample(negs, n_neg)):
+				row[f"negative_{i}"] = prep_doc(corpus[nid])
 
-def cache_key(args: argparse.Namespace) -> str:
-    payload = {
-        "cache_version": CACHE_VERSION,
-        "data": file_identity(Path(args.data)),
-        "corpus": file_identity(Path(args.corpus)),
-        "negatives": args.negatives,
-        "validation_fraction": args.validation_fraction,
-        "seed": args.seed,
-    }
-    serialized = json.dumps(payload, sort_keys=True).encode("utf-8")
-    return hashlib.blake2b(serialized, digest_size=12).hexdigest()
-
-
-def is_validation_cluster(cluster: str, fraction: float, seed: int) -> bool:
-    digest = hashlib.blake2b(
-        f"{seed}\0{cluster}".encode("utf-8"), digest_size=8
-    ).digest()
-    return int.from_bytes(digest, "big") / float(1 << 64) < fraction
-
-
-def load_valid_corpus_ids(path: Path) -> set[str]:
-    valid: set[str] = set()
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            record = json.loads(line)
-            if (record.get("text") or "").strip():
-                valid.add(str(record["id"]))
-    return valid
+			cluster = r.get("cluster") or r.get("source_case") or q
+			if cluster_bucket(cluster) < val_buckets:
+				fva.write(json.dumps(row, ensure_ascii=False) + "\n")
+				stats["val"] += 1
+			else:
+				ftr.write(json.dumps(row, ensure_ascii=False) + "\n")
+				stats["train"] += 1
+	return stats
 
 
-def iter_reference_rows(
-    data_path: str,
-    corpus_path: str,
-    negatives_per_query: int,
-    validation_fraction: float,
-    seed: int,
-    split: str,
-) -> Iterator[dict[str, str]]:
-    """Yield only query text and document IDs; never duplicate corpus text."""
-    valid_ids = load_valid_corpus_ids(Path(corpus_path))
-    emitted = 0
-    skipped = 0
+def write_eval_slice(train_rows, corpus: dict[str, str], out: Path,
+					 max_queries: int, max_docs: int, val_frac: float,
+					 rng: random.Random) -> dict:
+	"""
+	Capped IR slice for in-training model selection, WRITTEN TO DISK so every
+	rank can load it without a corpus dict. Gold docs always included, topped
+	up with random distractors. A relative signal only: the real evaluation is
+	the temporal holdout against the full corpus, run separately.
+	"""
+	val_buckets = max(1, int(100 * val_frac))
+	queries, relevant, gold = {}, {}, set()
+	for r in train_rows:
+		cluster = r.get("cluster") or r.get("source_case") or r.get("query")
+		if cluster_bucket(cluster) >= val_buckets:
+			continue
+		pos = [p for p in (r.get("positives") or []) if p in corpus]
+		if not pos or not r.get("query"):
+			continue
+		qid = f"q{len(queries)}"
+		queries[qid] = prep_query(r["query"])
+		relevant[qid] = sorted(pos)
+		gold.update(pos)
+		if len(queries) >= max_queries:
+			break
 
-    with Path(data_path).open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle):
-            record = json.loads(line)
-            query = (record.get("query") or "").strip()
-
-            positives = [str(item) for item in record.get("positives", [])]
-            positives = [item for item in positives if item in valid_ids]
-            positive_ids = set(positives)
-
-            raw_negatives = [
-                item.get("id") if isinstance(item, dict) else item
-                for item in record.get("negatives", [])
-            ]
-            negatives = []
-            seen_negatives: set[str] = set()
-            for item in raw_negatives:
-                if item is None:
-                    continue
-                document_id = str(item)
-                if (
-                    document_id in valid_ids
-                    and document_id not in positive_ids
-                    and document_id not in seen_negatives
-                ):
-                    seen_negatives.add(document_id)
-                    negatives.append(document_id)
-
-            if not query or not positives or len(negatives) < negatives_per_query:
-                skipped += 1
-                continue
-
-            cluster = str(
-                record.get("cluster")
-                or record.get("source_case")
-                or query
-            )
-            row_is_validation = is_validation_cluster(
-                cluster, validation_fraction, seed
-            )
-            if row_is_validation != (split == "validation"):
-                continue
-
-            row_seed = int.from_bytes(
-                hashlib.blake2b(
-                    f"{seed}\0{line_number}".encode("utf-8"), digest_size=8
-                ).digest(),
-                "big",
-            )
-            rng = random.Random(row_seed)
-            row = {
-                "anchor": query,
-                "positive": rng.choice(positives),
-            }
-            for index, document_id in enumerate(
-                rng.sample(negatives, negatives_per_query)
-            ):
-                row[f"negative_{index}"] = document_id
-            emitted += 1
-            yield row
-
-    log.info("%s: emitted=%d skipped=%d", split, emitted, skipped)
+	doc_ids = set(gold)
+	pool = [a for a in corpus if a not in gold]
+	rng.shuffle(pool)
+	doc_ids.update(pool[:max(0, max_docs - len(doc_ids))])
+	payload = {"queries": queries, "relevant": relevant,
+			   "corpus": {a: prep_doc(corpus[a]) for a in doc_ids}}
+	out.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+	return {"queries": len(queries), "docs": len(doc_ids), "gold": len(gold)}
 
 
-def reference_features(negative_count: int) -> Features:
-    columns = {
-        "anchor": Value("string"),
-        "positive": Value("string"),
-    }
-    columns.update(
-        {f"negative_{index}": Value("string") for index in range(negative_count)}
-    )
-    return Features(columns)
+def prepare(args, cache: Path) -> None:
+	rng = random.Random(args.seed)
+	log.info("loading corpus from %s [%s]", args.dataset, args.corpus_config)
+	corpus = load_corpus(args.dataset, args.corpus_config)
+	log.info("corpus: %d documents", len(corpus))
+
+	train_ds = load_dataset(args.dataset, args.train_config, split="train")
+	log.info("train source: %d rows", train_ds.num_rows)
+
+	stats = write_examples(train_ds, corpus, args.negatives,
+						   cache / "train_pairs.jsonl", cache / "val_pairs.jsonl",
+						   args.val_frac, rng, use_weights=not args.ignore_weights)
+	log.info("prepared %s", stats)
+
+	ev = write_eval_slice(train_ds, corpus, cache / "eval_slice.json",
+						  args.eval_queries, args.eval_docs, args.val_frac, rng)
+	log.info("eval slice %s", ev)
+	(cache / "READY").write_text(json.dumps({**stats, "eval": ev}))
+	del corpus, train_ds
 
 
-def build_reference_cache(args: argparse.Namespace, destination: Path) -> None:
-    """Create one atomic cache shared by every torchrun worker."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(destination) + ".lock"):
-        if (destination / "dataset_dict.json").exists():
-            return
+# ------------------------- VERSION COMPAT ----------------------------------
 
-        temporary = destination.parent / f".{destination.name}.tmp-{os.getpid()}"
-        if temporary.exists():
-            shutil.rmtree(temporary)
-        generator_cache = temporary / "generator"
-        saved = temporary / "dataset"
-        generator_cache.mkdir(parents=True)
+def compat_training_args(cls, kwargs: dict, main: bool) -> dict:
+	"""
+	Keep only arguments this transformers version accepts.
 
-        common = {
-            "data_path": str(Path(args.data).resolve()),
-            "corpus_path": str(Path(args.corpus).resolve()),
-            "negatives_per_query": args.negatives,
-            "validation_fraction": args.validation_fraction,
-            "seed": args.seed,
-        }
-        features = reference_features(args.negatives)
-        log.info("building compact dataset cache at %s", destination)
-
-        train = Dataset.from_generator(
-            iter_reference_rows,
-            gen_kwargs={**common, "split": "train"},
-            features=features,
-            cache_dir=str(generator_cache),
-            keep_in_memory=False,
-            writer_batch_size=1_000,
-        )
-        validation = Dataset.from_generator(
-            iter_reference_rows,
-            gen_kwargs={**common, "split": "validation"},
-            features=features,
-            cache_dir=str(generator_cache),
-            keep_in_memory=False,
-            writer_batch_size=1_000,
-        )
-        DatasetDict({"train": train, "validation": validation}).save_to_disk(
-            str(saved), max_shard_size="1GB"
-        )
-
-        del train, validation
-        gc.collect()
-        os.replace(saved, destination)
-        shutil.rmtree(temporary)
-        log.info("published dataset cache at %s", destination)
+	transformers 5.15 REMOVED `logging_dir` and `warmup_ratio` (both now raise
+	TypeError). Rather than pin a version, arguments are filtered against the
+	installed signature -- and every dropped one is LOGGED, because silently
+	losing e.g. push_to_hub would be far worse than a crash.
+	"""
+	accepted = set(inspect.signature(cls.__init__).parameters)
+	# dataclass-based args also expose their fields here
+	accepted |= set(getattr(cls, "__dataclass_fields__", {}))
+	kept = {k: v for k, v in kwargs.items() if k in accepted}
+	dropped = sorted(set(kwargs) - set(kept))
+	if dropped and main:
+		log.warning("TrainingArguments: dropped unsupported args %s", dropped)
+	return kept
 
 
-def load_corpus(path: Path, cache_dir: Path) -> Dataset:
-    corpus = load_dataset(
-        "json",
-        data_files={"train": str(path.resolve())},
-        split="train",
-        cache_dir=str(cache_dir),
-        keep_in_memory=False,
-    )
-    missing = {"id", "text"}.difference(corpus.column_names)
-    if missing:
-        raise ValueError(f"corpus is missing columns: {sorted(missing)}")
-    return corpus.select_columns(["id", "text"])
+def warmup_steps_for(n_rows: int, per_device_bs: int, world: int,
+					 epochs: float, ratio: float) -> int:
+	"""`warmup_ratio` is gone in transformers >= 5.15; compute the step count
+	it used to imply. Approximate is fine -- warmup is not sensitive to +-5%."""
+	steps_per_epoch = math.ceil(n_rows / max(1, per_device_bs * world))
+	return max(1, round(ratio * steps_per_epoch * epochs))
 
 
-def index_corpus(corpus: Dataset) -> dict[str, int]:
-    index: dict[str, int] = {}
-    offset = 0
-    for batch in corpus.iter(batch_size=10_000):
-        for relative, document_id in enumerate(batch["id"]):
-            index[str(document_id)] = offset + relative
-        offset += len(batch["id"])
-    log.info("indexed %d corpus documents", len(index))
-    return index
+# ------------------------- TRAINING (all ranks) ----------------------------
 
-
-def attach_text_lookup(
-    references: Dataset,
-    corpus: Dataset,
-    corpus_index: dict[str, int],
-    query_prefix: str,
-    document_prefix: str,
-) -> Dataset:
-    document_columns = [
-        column for column in references.column_names if column != "anchor"
-    ]
-
-    def transform(batch: dict[str, list[str]]) -> dict[str, list[str]]:
-        batch_size = len(batch["anchor"])
-        output = {
-            "anchor": [query_prefix + query for query in batch["anchor"]]
-        }
-
-        row_indices: list[int] = []
-        for column in document_columns:
-            try:
-                row_indices.extend(corpus_index[item] for item in batch[column])
-            except KeyError as error:
-                raise KeyError(
-                    f"document ID missing from corpus: {error.args[0]}"
-                ) from error
-
-        texts = corpus[row_indices]["text"]
-        for column_number, column in enumerate(document_columns):
-            start = column_number * batch_size
-            output[column] = [
-                document_prefix + (text or "").strip()
-                for text in texts[start : start + batch_size]
-            ]
-        return output
-
-    return references.with_transform(transform)
-
-
-def prepare_datasets(
-    args: argparse.Namespace,
-) -> tuple[Dataset, Dataset, Dataset, dict[str, int]]:
-    root = Path(args.cache_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    references_path = root / f"references-{cache_key(args)}"
-    build_reference_cache(args, references_path)
-
-    references = load_from_disk(str(references_path), keep_in_memory=False)
-    corpus = load_corpus(Path(args.corpus), root / "corpus-arrow")
-    corpus_index = index_corpus(corpus)
-
-    train = attach_text_lookup(
-        references["train"],
-        corpus,
-        corpus_index,
-        args.query_prefix,
-        args.document_prefix,
-    )
-    validation_refs = references["validation"]
-    if 0 < args.max_eval_samples < len(validation_refs):
-        validation_refs = validation_refs.select(range(args.max_eval_samples))
-    validation = attach_text_lookup(
-        validation_refs,
-        corpus,
-        corpus_index,
-        args.query_prefix,
-        args.document_prefix,
-    )
-    log.info(
-        "dataset ready: train=%d validation=%d corpus=%d",
-        len(train),
-        len(validation),
-        len(corpus),
-    )
-    return train, validation, corpus, corpus_index
+def load_evaluator(path: Path) -> InformationRetrievalEvaluator | None:
+	if not path.exists():
+		return None
+	d = json.loads(path.read_text(encoding="utf-8"))
+	if not d["queries"]:
+		return None
+	return InformationRetrievalEvaluator(
+		queries=d["queries"], corpus=d["corpus"],
+		relevant_docs={k: set(v) for k, v in d["relevant"].items()},
+		name="legal-val", accuracy_at_k=[1, 5, 10],
+		precision_recall_at_k=[1, 10], ndcg_at_k=[10], mrr_at_k=[10],
+		show_progress_bar=False, batch_size=128, write_csv=False)
 
 
 # ---------------------------------------------------------------------------
-# Model and training
+# Drop-in replacements for train_cl.py. Replace your build_model() with this
+# block, and add the four --lora* arguments shown at the bottom to main().
 # ---------------------------------------------------------------------------
 
-def freeze_unused_pooler(model: SentenceTransformer) -> None:
-    """Freeze HF's classification pooler; ST uses its own pooling module."""
-    first_module = model._first_module()
-    backbone = getattr(first_module, "auto_model", None)
-    pooler = getattr(backbone, "pooler", None)
-    if pooler is None:
-        return
+def freeze_unused_pooler(model) -> list[str]:
+	"""
+	Freeze the transformer's built-in `pooler` (and any LoRA adapters placed
+	on it). e5 MEAN-pools token embeddings, so the XLM-R pooler never enters
+	the loss; left trainable, DDP (find_unused_parameters=False) waits for its
+	gradient forever -- the "Expected to have finished reduction" error at
+	parameter indices 197/198.
 
-    trainable = [parameter for parameter in pooler.parameters() if parameter.requires_grad]
-    for parameter in trainable:
-        parameter.requires_grad_(False)
-    if trainable:
-        log.info("froze %d unused backbone pooler tensors", len(trainable))
+	Matches on the path segment ".pooler.", so it also catches LoRA weights
+	such as "...pooler.dense.lora_A.default.weight" when target_modules is
+	"all-linear".
+	"""
+	frozen = []
+	for name, param in model.named_parameters():
+		if ".pooler." in f".{name}." and param.requires_grad:
+			param.requires_grad = False
+			frozen.append(name)
+	if frozen:
+		log.info("froze %d unused pooler tensors: %s", len(frozen), frozen)
+	return frozen
+
 
 
 def build_model(args: argparse.Namespace) -> SentenceTransformer:
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+	local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+	device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+	if torch.cuda.is_available():
+		torch.cuda.set_device(local_rank)
 
-    model = SentenceTransformer(
-        args.model,
-        device=device,
-        model_kwargs={
-            "torch_dtype": torch.bfloat16,
-            "low_cpu_mem_usage": True,
-            "attn_implementation": "sdpa",
-        },
-    )
-    model.max_seq_length = args.max_length
+	model_kwargs = {"low_cpu_mem_usage": True, "attn_implementation": "sdpa"}
+	# FULL FINE-TUNING: keep FP32 master weights. bf16=True in the training
+	# args already runs the forward/backward in bf16 via autocast; loading the
+	# weights themselves in bf16 means updates of ~lr*1 = 3e-5 are below
+	# bf16's rounding step for typical weights (~0.02), so many round to zero
+	# and training silently stalls.
+	# LoRA: the base is frozen and only small adapters train, so bf16 base
+	# weights are fine and save memory.
+	if args.lora:
+		model_kwargs["torch_dtype"] = torch.bfloat16
 
-    first_module = model._first_module()
-    backbone = getattr(first_module, "auto_model", None)
-    if backbone is not None and hasattr(backbone, "config"):
-        backbone.config.use_cache = False
+	model = SentenceTransformer(args.model, device=device,
+								model_kwargs=model_kwargs)
+	model.max_seq_length = args.max_len          # was args.max_length (no such arg)
 
-    if args.lora:
-        try:
-            from peft import LoraConfig, TaskType
-        except ImportError as error:
-            raise RuntimeError("--lora requires the peft package") from error
+	backbone = getattr(model._first_module(), "auto_model", None)
+	if backbone is not None and hasattr(backbone, "config"):
+		backbone.config.use_cache = False
 
-        model.add_adapter(
-            LoraConfig(
-                task_type=TaskType.FEATURE_EXTRACTION,
-                inference_mode=False,
-                target_modules="all-linear",
-                r=args.lora_r,
-                lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-            )
-        )
+	if args.lora:
+		try:
+			from peft import LoraConfig, TaskType
+		except ImportError as error:
+			raise RuntimeError("--lora requires the peft package") from error
+		model.add_adapter(LoraConfig(
+			task_type=TaskType.FEATURE_EXTRACTION,
+			inference_mode=False,
+			target_modules="all-linear",
+			r=args.lora_r,
+			lora_alpha=args.lora_alpha,
+			lora_dropout=args.lora_dropout,
+		))
 
-    # Run after adapter injection so any pooler adapters are frozen too.
-    freeze_unused_pooler(model)
-    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    total = sum(parameter.numel() for parameter in model.parameters())
-    log.info(
-        "model parameters: trainable=%.2fM total=%.2fM (%.3f%%)",
-        trainable / 1e6,
-        total / 1e6,
-        100.0 * trainable / total,
-    )
-    return model
+	# After adapter injection, so pooler adapters are frozen too.
+	freeze_unused_pooler(model)
+
+	trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+	total = sum(p.numel() for p in model.parameters())
+	log.info("model parameters: trainable=%.2fM total=%.2fM (%.3f%%) dtype=%s",
+			 trainable / 1e6, total / 1e6, 100.0 * trainable / total,
+			 next(model.parameters()).dtype)
+	return model
 
 
-def main() -> None:
-    validate_versions()
-    args = parse_args()
-    validate_hub_authentication(args)
-    torch.manual_seed(args.seed)
+# ---- add to main()'s argparse ---------------------------------------------
+#   ap.add_argument("--lora", action="store_true",
+#                   help="Not recommended below ~1B params: full FT fits and "
+#                        "adapts the representation better.")
+#   ap.add_argument("--lora-r", type=int, default=32)
+#   ap.add_argument("--lora-alpha", type=int, default=64)
+#   ap.add_argument("--lora-dropout", type=float, default=0.05)
 
-    train_dataset, eval_dataset, corpus, corpus_index = prepare_datasets(args)
-    if args.prepare_data_only:
-        log.info("data preparation completed")
-        return
 
-    model = build_model(args)
-    loss = CachedMultipleNegativesRankingLoss(
-        model=model,
-        mini_batch_size=args.mini_batch_size,
-        scale=20.0,
-        gather_across_devices=args.gather_across_devices,
-        show_progress_bar=False,
-    )
+def main():
+	ap = argparse.ArgumentParser()
+	ap.add_argument("--dataset", default=os.environ.get("HF_DATASET"))
+	ap.add_argument("--corpus-config", default="corpus")
+	ap.add_argument("--train-config", default="train")
+	ap.add_argument("--model", default="intfloat/multilingual-e5-large-instruct")
+	ap.add_argument("--out", default="runs/e5-large-inst")
+	ap.add_argument("--hub-model-id", default=os.environ.get("HF_MODEL_REPO"),
+					help="username/repo to push checkpoints to. Omit to keep local.")
+	ap.add_argument("--hub-public", action="store_true",
+					help="Create the Hub repo public (default: private).")
+	ap.add_argument("--resume", action="store_true",
+					help="Resume from the latest checkpoint (local, or pulled "
+						 "from the Hub's last-checkpoint folder).")
+	ap.add_argument("--epochs", type=float, default=3.0)
+	ap.add_argument("--batch-size", type=int, default=256,
+					help="PER DEVICE. The contrastive-signal knob, not memory.")
+	ap.add_argument("--mini-batch", type=int, default=64,
+					help="GradCache chunk: memory only, does not change the loss.")
+	ap.add_argument("--negatives", type=int, default=8)
+	ap.add_argument("--lr", type=float, default=3e-5)
+	ap.add_argument("--max-len", type=int, default=512)
+	ap.add_argument("--val-frac", type=float, default=0.03)
+	ap.add_argument("--eval-queries", type=int, default=500)
+	ap.add_argument("--eval-docs", type=int, default=20000)
+	ap.add_argument("--save-steps", type=int, default=500)
+	ap.add_argument("--workers", type=int, default=2)
+	ap.add_argument("--ignore-weights", action="store_true",
+					help="Keep every row regardless of its sample weight.")
+	ap.add_argument("--reprepare", action="store_true",
+					help="Rebuild prepared data even if it already exists.")
+	ap.add_argument("--lora", action="store_true",
+					help="Not recommended below ~1B params: full FT fits and "
+						"adapts the representation better.")
+	ap.add_argument("--lora-r", type=int, default=32)
+	ap.add_argument("--lora-alpha", type=int, default=64)
+	ap.add_argument("--lora-dropout", type=float, default=0.05)
+	ap.add_argument("--seed", type=int, default=42)
+	args = ap.parse_args()
+	if not args.dataset:
+		raise SystemExit("--dataset (or HF_DATASET) is required")
 
-    training_args = SentenceTransformerTrainingArguments(
-        output_dir=args.output,
-        run_name=args.run_name or Path(args.output).name,
-        num_train_epochs=args.epochs,
-        max_steps=args.max_steps,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
-        lr_scheduler_type="cosine",
-        optim="adamw_torch_fused",
-        bf16=True,
-        tf32=True,
-        # Do not combine activation checkpointing with a Cached* loss. GradCache
-        # already saves memory by replaying mini-batches during backward.
-        gradient_checkpointing=False,
-        batch_sampler=BatchSamplers.NO_DUPLICATES,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        logging_steps=args.logging_steps,
-        logging_first_step=True,
-        logging_dir=args.logging_dir or str(Path(args.output) / "tensorboard"),
-        report_to=args.report_to,
-        push_to_hub=args.push_to_hub,
-        hub_model_id=args.hub_model_id,
-        hub_strategy=args.hub_strategy,
-        hub_private_repo=True if args.hub_private else None,
-        hub_always_push=args.hub_always_push,
-        seed=args.seed,
-        data_seed=args.seed,
-        dataloader_drop_last=True,
-        dataloader_num_workers=args.dataloader_workers,
-        dataloader_pin_memory=args.pin_memory,
-        dataloader_persistent_workers=False,
-        ddp_find_unused_parameters=False,
-        ddp_broadcast_buffers=False,
-    )
+	state = PartialState()
+	cache = Path(args.out) / "data"
+	ready = cache / "READY"
 
-    trainer = SentenceTransformerTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        loss=loss,
-        evaluator=None,
-    )
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+	# ---- rank 0 prepares; everyone else waits --------------------------
+	if state.is_main_process:
+		cache.mkdir(parents=True, exist_ok=True)
+		if args.reprepare or not ready.exists():
+			if ready.exists():
+				ready.unlink()
+			prepare(args, cache)
+		else:
+			log.info("reusing prepared data: %s", ready.read_text())
+	state.wait_for_everyone()
 
-    if args.push_to_hub:
-        # This is blocking: it waits for any asynchronous checkpoint upload,
-        # publishes the final model at the repository root, and only then
-        # returns. Save the local final/ copy afterwards so it is not uploaded
-        # a second time as a nested duplicate.
-        trainer.push_to_hub(commit_message="Training complete")
-        trainer.save_model(
-            str(Path(args.output) / "final"),
-            _internal_call=True,
-        )
-    else:
-        trainer.save_model(str(Path(args.output) / "final"))
+	ds = load_dataset("json",
+					  data_files={"train": str(cache / "train_pairs.jsonl"),
+								  "validation": str(cache / "val_pairs.jsonl")},
+					  cache_dir=str(cache / "hf"))
+	evaluator = load_evaluator(cache / "eval_slice.json")
+	if state.is_main_process:
+		log.info("train %d / val %d rows (memory-mapped)",
+				 ds["train"].num_rows, ds["validation"].num_rows)
 
-    del corpus_index, corpus, train_dataset, eval_dataset
-    gc.collect()
+	# ---- model ----------------------------------------------------------
+	# model = SentenceTransformer(args.model,
+	#                             model_kwargs={"torch_dtype": torch.bfloat16})
+
+	# model.max_seq_length = args.max_len
+	model = build_model(args)
+	# Stored with the model, so anyone loading it from the Hub gets the right
+	# prefixes via encode(..., prompt_name="query"). NOT used during training:
+	# the prefixes are already in the data, and applying them twice would
+	# prepend "query: query: ".
+	model.prompts = {"query": f"Instruct: {TASK_DESCRIPTION}\nQuery: ", "document": ""}
+
+	loss = CachedMultipleNegativesRankingLoss(
+		model, mini_batch_size=args.mini_batch, scale=20.0)
+
+	push = bool(args.hub_model_id)
+
+	# TensorBoard directory: transformers >= 5.15 reads this env var instead of
+	# the removed `logging_dir`. Setting both is harmless on older versions.
+	tb_dir = str(Path(args.out) / "runs")
+	os.environ["TENSORBOARD_LOGGING_DIR"] = tb_dir
+
+	warmup = warmup_steps_for(ds["train"].num_rows, args.batch_size,
+							  state.num_processes, args.epochs, 0.1)
+	if state.is_main_process:
+		log.info("warmup_steps=%d (10%% of ~%d total optimizer steps)", warmup,
+				 warmup * 10)
+
+	targs_kw = dict(
+		output_dir=args.out,
+		num_train_epochs=args.epochs,
+		per_device_train_batch_size=args.batch_size,
+		per_device_eval_batch_size=args.batch_size,
+		learning_rate=args.lr,
+		warmup_steps=warmup,               # replaces warmup_ratio (removed in 5.15)
+		weight_decay=0.01,
+		lr_scheduler_type="cosine",
+		bf16=True,
+		gradient_checkpointing=False,
+		dataloader_num_workers=args.workers,
+		dataloader_pin_memory=False,
+		batch_sampler=BatchSamplers.NO_DUPLICATES,
+
+		eval_strategy="steps" if evaluator else "no",
+		eval_steps=args.save_steps,
+		save_strategy="steps",
+		save_steps=args.save_steps,
+		save_total_limit=3,
+		load_best_model_at_end=bool(evaluator),
+		metric_for_best_model="eval_legal-val_cosine_ndcg@10",
+		greater_is_better=True,
+
+		# ---- logging: TensorBoard --------------------------------------
+		report_to=["tensorboard"],
+		logging_dir=tb_dir,                # dropped automatically on >= 5.15
+		logging_steps=25,
+		logging_first_step=True,
+
+		# ---- checkpoints -> Hub -----------------------------------------
+		push_to_hub=push,
+		hub_model_id=args.hub_model_id if push else None,
+		hub_strategy="checkpoint",
+		hub_private_repo=not args.hub_public,
+
+		seed=args.seed,
+		ddp_find_unused_parameters=False,
+	)
+	targs = SentenceTransformerTrainingArguments(
+		**compat_training_args(SentenceTransformerTrainingArguments, targs_kw,
+							   state.is_main_process))
+	if push and not getattr(targs, "push_to_hub", False) and state.is_main_process:
+		log.warning("push_to_hub was NOT applied -- checkpoints will stay local")
+
+	trainer = SentenceTransformerTrainer(
+		model=model, args=targs,
+		train_dataset=ds["train"], eval_dataset=ds["validation"],
+		loss=loss, evaluator=evaluator)
+
+	resume = None
+	if args.resume:
+		local = sorted(Path(args.out).glob("checkpoint-*"),
+					   key=lambda p: int(p.name.split("-")[-1]))
+		if local:
+			resume = str(local[-1])
+		elif push:
+			# fresh box: pull the resumable checkpoint the Hub kept for us
+			from huggingface_hub import snapshot_download
+			snap = snapshot_download(args.hub_model_id,
+									 allow_patterns=["last-checkpoint/*"],
+									 local_dir=args.out)
+			cand = Path(snap) / "last-checkpoint"
+			resume = str(cand) if cand.exists() else None
+		if state.is_main_process:
+			log.info("resuming from %s", resume or "(nothing found; fresh start)")
+
+	trainer.train(resume_from_checkpoint=resume)
+
+	# ---- final model ----------------------------------------------------
+	final = Path(args.out) / "final"
+	if state.is_main_process:
+		model.save_pretrained(str(final))
+		log.info("saved final model to %s", final)
+	if push:
+		# Pushes the best model (load_best_model_at_end) with a model card,
+		# the prompts above, and the TensorBoard logs.
+		trainer.push_to_hub(commit_message="final model")
+		if state.is_main_process:
+			log.info("pushed to https://huggingface.co/%s", args.hub_model_id)
 
 
 if __name__ == "__main__":
-    main()
+	main()

@@ -1,6 +1,6 @@
 export HF_TOKEN=hf_xxx                      # needs write access
 export HF_DATASET=Ehsanl/retnlr
-export HF_MODEL_REPO=Ehsanl/me5-base-nlr
+export HF_MODEL_REPO=Ehsanl/me5-large-inst-nlr
 bash setup.sh
 source ~/retriever/env.sh
-accelerate launch train_cl.py
+accelerate launch train.py
