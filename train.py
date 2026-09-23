@@ -292,7 +292,7 @@ def build_model(args: argparse.Namespace) -> SentenceTransformer:
 	if torch.cuda.is_available():
 		torch.cuda.set_device(local_rank)
 
-	model_kwargs = {"low_cpu_mem_usage": True, "attn_implementation": "sdpa"}
+	model_kwargs = {"low_cpu_mem_usage": True, "attn_implementation": "sdpa", "torch_dtype": torch.float32}
 	# FULL FINE-TUNING: keep FP32 master weights. bf16=True in the training
 	# args already runs the forward/backward in bf16 via autocast; loading the
 	# weights themselves in bf16 means updates of ~lr*1 = 3e-5 are below
@@ -360,15 +360,14 @@ def main():
 					help="Resume from the latest checkpoint (local, or pulled "
 						 "from the Hub's last-checkpoint folder).")
 	ap.add_argument("--epochs", type=float, default=3.0)
-	ap.add_argument("--batch-size", type=int, default=256,
+	ap.add_argument("--batch-size", type=int, default=512,
 					help="PER DEVICE. The contrastive-signal knob, not memory.")
-	ap.add_argument("--mini-batch", type=int, default=64,
+	ap.add_argument("--mini-batch", type=int, default=96,
 					help="GradCache chunk: memory only, does not change the loss.")
 	ap.add_argument("--gather_across_devices", action="store_true",
 					help="for CachedMultipleNegativesRankingLoss")
 	ap.add_argument("--negatives", type=int, default=8)
-	ap.add_argument("--lr", type=float, default=1.5e-5)
-	ap.add_argument("--scale", type=float, default=50.0)
+	ap.add_argument("--lr", type=float, default=1e-5)
 	ap.add_argument("--max-len", type=int, default=512)
 	ap.add_argument("--val-frac", type=float, default=0.03)
 	ap.add_argument("--eval-queries", type=int, default=500)
@@ -427,7 +426,7 @@ def main():
 	model.prompts = {"query": f"Instruct: {TASK_DESCRIPTION}\nQuery: ", "document": ""}
 
 	loss = CachedMultipleNegativesRankingLoss(
-		model, mini_batch_size=args.mini_batch, gather_across_devices=args.gather_across_devices, scale=args.scale)
+		model, mini_batch_size=args.mini_batch, gather_across_devices=args.gather_across_devices, scale=50.0)
 
 	push = bool(args.hub_model_id)
 
@@ -469,7 +468,7 @@ def main():
 		# ---- logging: TensorBoard --------------------------------------
 		report_to=["tensorboard"],
 		logging_dir=tb_dir,                # dropped automatically on >= 5.15
-		logging_steps=25,
+		logging_steps=10,
 		logging_first_step=True,
 
 		# ---- checkpoints -> Hub -----------------------------------------
